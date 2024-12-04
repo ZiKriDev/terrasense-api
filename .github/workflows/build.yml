@@ -1,0 +1,108 @@
+name: Build and Deploy JAR
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      cassandra:
+        image: cassandra:4.0
+        options: >-
+          --health-cmd="cqlsh -e 'describe keyspaces'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+        ports:
+          - 9042:9042
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: "adopt"
+          java-version: "17"
+
+      - name: Wait for Cassandra
+        run: |
+          echo "Waiting for Cassandra to start..."
+          until nc -z localhost 9042; do
+            sleep 5
+          done
+          echo "Cassandra is up and running."
+
+      - name: Configure Cassandra Authentication
+        run: |
+          echo "Configuring Cassandra Authentication..."
+          CONTAINER_ID=$(docker ps -qf "ancestor=cassandra:4.0")
+          docker exec $CONTAINER_ID bash -c "
+            sed -i 's/authenticator: AllowAllAuthenticator/authenticator: PasswordAuthenticator/' /etc/cassandra/cassandra.yaml;
+            sed -i 's/role_manager: native/role_manager: CassandraRoleManager/' /etc/cassandra/cassandra.yaml
+          "
+          docker restart $CONTAINER_ID
+
+      - name: Wait for Cassandra to Restart with Authentication
+        run: |
+          echo "Waiting for Cassandra to restart with authentication..."
+          CONTAINER_ID=$(docker ps -qf "ancestor=cassandra:4.0")
+          sleep 15
+          until docker exec $CONTAINER_ID cqlsh -u cassandra -p cassandra -e "SELECT release_version FROM system.local;"; do
+            echo "Cassandra is not ready yet..."
+            sleep 5
+          done
+          echo "Cassandra restarted and is ready with authentication enabled."
+
+      - name: Wait for Role Manager to Be Ready
+        run: |
+          echo "Waiting for Role Manager to be ready..."
+          CONTAINER_ID=$(docker ps -qf "ancestor=cassandra:4.0")
+          until docker exec $CONTAINER_ID cqlsh -u cassandra -p cassandra -e "LIST ROLES;"; do
+            echo "Role Manager is not ready yet..."
+            sleep 5
+          done
+          echo "Role Manager is ready."
+
+      - name: Create Cassandra User
+        run: |
+          echo "Creating Cassandra user..."
+          CONTAINER_ID=$(docker ps -qf "ancestor=cassandra:4.0")
+          docker exec $CONTAINER_ID cqlsh -u cassandra -p cassandra -e "ALTER ROLE cassandra WITH PASSWORD = 'cassandra' AND LOGIN = true;"
+
+      - name: Create Keyspace
+        run: |
+          echo "Creating keyspace..."
+          CONTAINER_ID=$(docker ps -qf "ancestor=cassandra:4.0")
+          docker exec $CONTAINER_ID cqlsh -u cassandra -p cassandra -e "CREATE KEYSPACE IF NOT EXISTS sensordata WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};"
+
+      - name: Build JAR
+        env:
+          SPRING_CASSANDRA_CONTACT_POINTS: localhost
+          SPRING_CASSANDRA_PORT: 9042
+          SPRING_CASSANDRA_KEYSPACE_NAME: sensordata
+          SPRING_CASSANDRA_LOCAL_DATACENTER: datacenter1
+          SPRING_CASSANDRA_USERNAME: cassandra
+          SPRING_CASSANDRA_PASSWORD: cassandra
+        run: |
+          export MVNW="./mvnw"
+          if [ "$(expr substr $(uname -s) 1 5)" == "MINGW" ]; then
+            MVNW="${MVNW}.cmd"
+          fi  
+          chmod +x "${MVNW}"
+          ${MVNW} clean package
+
+      - name: Upload JAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terrasense-api
+          path: target/*.jar
